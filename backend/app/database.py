@@ -32,6 +32,10 @@ ADDITIVE_COLUMNS = [
     ("files", "target_role", "VARCHAR(32)"),
     ("files", "decoy_generated_at", "DATETIME"),
     ("sessions", "decoy_mode", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("activity_logs", "honeytoken_id", "INTEGER"),
+    ("sessions", "anomaly_score", "FLOAT"),
+    ("sessions", "anomaly_flag", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("sessions", "is_synthetic", "BOOLEAN NOT NULL DEFAULT 0"),
 ]
 
 

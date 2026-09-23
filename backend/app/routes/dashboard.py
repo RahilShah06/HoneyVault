@@ -9,8 +9,8 @@ from sqlalchemy.orm import Session as DbSession
 
 from app.auth import TOKEN_TTL_HOURS, get_current_admin
 from app.database import get_db
-from app.detection import risk_engine
-from app.models import ActivityLog, File, User, UserSession, utcnow
+from app.detection import anomaly, features, risk_engine
+from app.models import ActivityLog, File, Honeytoken, User, UserSession, utcnow
 from app.routes.activity import ActivityOut, serialize_log
 
 router = APIRouter(prefix="/admin", tags=["dashboard"])
@@ -45,6 +45,8 @@ class SummaryOut(BaseModel):
     total_honeyfile_interactions: int
     high_risk_users: int
     total_sessions: int
+    honeytokens_planted: int
+    honeytokens_used: int
 
 
 class SessionOut(BaseModel):
@@ -60,11 +62,16 @@ class SessionOut(BaseModel):
     action_count: int
     honeyfile_interactions: int
     decoy_mode: bool
+    anomaly_score: Optional[float]
+    anomaly_flag: bool
 
 
 class SessionDetailOut(BaseModel):
     session: SessionOut
     timeline: List[ActivityOut]
+    # Why the model found this session unusual, in plain language. Empty when
+    # the session is unscored or nothing deviated far enough to name.
+    anomaly_reasons: List[str]
 
 
 def _iso(value) -> Optional[str]:
@@ -102,6 +109,8 @@ def _session_out(db: DbSession, s: UserSession) -> SessionOut:
         action_count=int(action_count),
         honeyfile_interactions=int(honey),
         decoy_mode=bool(s.decoy_mode),
+        anomaly_score=s.anomaly_score,
+        anomaly_flag=bool(s.anomaly_flag),
     )
 
 
@@ -118,7 +127,10 @@ def summary(
     )
     suspicious = (
         db.query(func.count(UserSession.id))
-        .filter(UserSession.total_risk_score > SUSPICIOUS_THRESHOLD)
+        .filter(
+            UserSession.total_risk_score > SUSPICIOUS_THRESHOLD,
+            UserSession.is_synthetic.is_(False),
+        )
         .scalar()
         or 0
     )
@@ -138,7 +150,19 @@ def summary(
         .scalar()
         or 0
     )
-    total_sessions = db.query(func.count(UserSession.id)).scalar() or 0
+    total_sessions = (
+        db.query(func.count(UserSession.id))
+        .filter(UserSession.is_synthetic.is_(False))
+        .scalar()
+        or 0
+    )
+    planted = db.query(func.count(Honeytoken.id)).scalar() or 0
+    used = (
+        db.query(func.count(Honeytoken.id))
+        .filter(Honeytoken.first_used_at.isnot(None))
+        .scalar()
+        or 0
+    )
 
     return SummaryOut(
         active_sessions=int(active),
@@ -146,6 +170,8 @@ def summary(
         total_honeyfile_interactions=int(honey_interactions),
         high_risk_users=int(high_risk_users),
         total_sessions=int(total_sessions),
+        honeytokens_planted=int(planted),
+        honeytokens_used=int(used),
     )
 
 
@@ -172,7 +198,7 @@ def list_sessions(
     current: Tuple[User, UserSession] = Depends(get_current_admin),
     db: DbSession = Depends(get_db),
 ):
-    q = db.query(UserSession)
+    q = db.query(UserSession).filter(UserSession.is_synthetic.is_(False))
     if active_only:
         q = q.filter(active_session_clause())
     sessions = q.order_by(UserSession.login_time.desc()).limit(limit).all()
@@ -196,9 +222,11 @@ def session_detail(
         .order_by(ActivityLog.timestamp.asc(), ActivityLog.id.asc())
         .all()
     )
+    scored = anomaly.score_session(db, s)
     return SessionDetailOut(
         session=_session_out(db, s),
         timeline=[serialize_log(log) for log in timeline],
+        anomaly_reasons=(scored[2] if scored else []),
     )
 
 
@@ -262,6 +290,18 @@ def scoring_rules(
             "points_each": risk_engine.FAILED_LOGIN_POINTS,
             "max": risk_engine.FAILED_LOGIN_MAX,
             "lookback_minutes": risk_engine.FAILED_LOGIN_LOOKBACK_MINUTES,
+        },
+        "honeytoken_used": risk_engine.HONEYTOKEN_POINTS,
+        "role_weighting": {
+            "in_role": risk_engine.ROLE_WEIGHT_IN_ROLE,
+            "out_of_role": risk_engine.ROLE_WEIGHT_OUT_OF_ROLE,
+            "applies_to": "honeyfile open and download points",
+        },
+        "anomaly_detection": {
+            "status": anomaly.status(),
+            "features": features.FEATURE_NAMES,
+            "independent_of_rules": True,
+            "flag_threshold": anomaly.FLAG_THRESHOLD,
         },
         "sensitive_keywords": risk_engine.SENSITIVE_KEYWORDS,
         "active_response": {

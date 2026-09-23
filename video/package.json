@@ -1,0 +1,12 @@
+{
+  "name": "honeyvault-demo-recorder",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "scripts": {
+    "record": "node record.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0"
+  }
+}

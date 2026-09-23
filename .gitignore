@@ -12,3 +12,13 @@ frontend/dist/
 
 # env
 .env
+anomaly_model.joblib
+
+# demo video pipeline
+video/node_modules/
+remotion/node_modules/
+remotion/public/*.webm
+recordings/
+scratch-frames/
+cloud-honeyvault-demo.mp4
+render.log

@@ -15,10 +15,11 @@ Demo passwords live in README.md only.
 """
 import argparse
 
+from app import baseline_traffic
 from app.auth import hash_password
 from app.database import Base, SessionLocal, engine, init_db
-from app.detection import decoy_generator
-from app.models import File, Folder, User, utcnow
+from app.detection import anomaly, decoy_generator
+from app.models import File, Folder, Honeytoken, User, UserSession
 
 FOLDERS = [
     # name, allowed_roles ("*" == normal for everyone)
@@ -153,11 +154,7 @@ def _upsert_honeyfiles(db, folders, regenerate: bool):
                 existing.decoy_generated_at = None
 
         if not (existing.content or "").strip():
-            content, _source = decoy_generator.generate_content(
-                existing.filename, existing.target_role
-            )
-            existing.content = content
-            existing.decoy_generated_at = utcnow()
+            decoy_generator.build_and_plant(db, existing)
             generated += 1
     return generated
 
@@ -179,7 +176,43 @@ def _upsert_users(db):
             user.role = role
 
 
-def seed(reset: bool = False, regenerate_decoys: bool = False) -> None:
+def _build_baseline_and_model(db, days: int) -> None:
+    """Generate ordinary history, then fit the anomaly model on it.
+
+    Both steps are optional: without them the rule engine, the decoys and the
+    honeytokens all behave exactly the same, and anomaly columns stay NULL.
+    """
+    baseline_traffic.clear(db)
+    baseline_traffic.generate(db, days=days)
+    db.commit()
+
+    model = anomaly.train(db)
+    if model is None:
+        return
+
+    # Score the baseline itself, so the dashboard shows what normal looks like
+    # and the flag rate is visible rather than asserted.
+    scored = flagged = 0
+    for s in db.query(UserSession).filter(UserSession.is_synthetic.is_(True)):
+        result = anomaly.score_session(db, s)
+        if result is None:
+            continue
+        s.anomaly_score, s.anomaly_flag, _why = result
+        scored += 1
+        flagged += 1 if s.anomaly_flag else 0
+    db.commit()
+    if scored:
+        print(
+            "anomaly: %d/%d baseline sessions flagged (%.1f%% - expect a small number)"
+            % (flagged, scored, 100.0 * flagged / scored)
+        )
+
+
+def seed(
+    reset: bool = False,
+    regenerate_decoys: bool = False,
+    history_days: int = 45,
+) -> None:
     if reset:
         Base.metadata.drop_all(bind=engine)
     init_db()
@@ -193,11 +226,19 @@ def seed(reset: bool = False, regenerate_decoys: bool = False) -> None:
         db.commit()
 
         honey = db.query(File).filter(File.is_honeyfile.is_(True)).count()
+        tokens = db.query(Honeytoken).count()
         print("Seeded:")
         print("  folders: %d" % db.query(Folder).count())
         print("  files:   %d (%d honeyfiles)" % (db.query(File).count(), honey))
         print("  users:   %d" % db.query(User).count())
         print("  decoy bodies generated this run: %d" % generated)
+        print("  honeytokens planted: %d" % tokens)
+
+        if history_days > 0:
+            _build_baseline_and_model(db, history_days)
+        else:
+            print("  baseline history: skipped (--no-history)")
+
         print("Demo credentials are listed in README.md.")
     finally:
         db.close()
@@ -215,5 +256,20 @@ if __name__ == "__main__":
         action="store_true",
         help="clear cached honeyfile content and generate it again",
     )
+    parser.add_argument(
+        "--history-days",
+        type=int,
+        default=45,
+        help="days of synthetic baseline traffic to generate (default 45)",
+    )
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="skip baseline generation and model training entirely",
+    )
     args = parser.parse_args()
-    seed(reset=args.reset, regenerate_decoys=args.regenerate_decoys)
+    seed(
+        reset=args.reset,
+        regenerate_decoys=args.regenerate_decoys,
+        history_days=0 if args.no_history else args.history_days,
+    )

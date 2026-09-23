@@ -10,8 +10,12 @@ total after every scored action.
     Open 2nd distinct honeyfile in session              +15
     Open 3rd+ distinct honeyfile in session             +20 each
     Download a honeyfile                                +20
+
+Honeyfile points are then role-weighted: halved when the file sits in the
+user's own folder, and multiplied by 1.5 when it does not.
     Sensitive-keyword search                            +15
     Open a non-honeyfile outside the role's folders     +20
+    Using a planted honeytoken anywhere in a request    +40
     5+ actions in any 60s window (once per session)     +15
     Carried-over failed logins on login                 +10 each, max +30
 
@@ -25,6 +29,7 @@ from typing import Optional, Tuple
 from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 
+from app.detection import anomaly
 from app.models import ActivityLog, File, User, UserSession, utcnow
 
 MAX_SCORE = 100
@@ -48,9 +53,20 @@ HONEYFILE_DOWNLOAD_POINTS = 20
 SENSITIVE_SEARCH_POINTS = 15
 RESTRICTED_ATTEMPT_POINTS = 20
 
+# Role weighting. The same click means different things depending on who made
+# it: an HR user opening an HR decoy is doing something close to their job,
+# a Designer opening the same file is reaching well outside it. The weight is
+# the distance between the user's role and the folder's normal audience.
+ROLE_WEIGHT_IN_ROLE = 0.5
+ROLE_WEIGHT_OUT_OF_ROLE = 1.5
+
 BURST_POINTS = 15
 BURST_WINDOW_SECONDS = 60
 BURST_ACTION_THRESHOLD = 5
+
+# Using a credential lifted out of a decoy file. Not a behavioural hint - it
+# is close to proof - so one occurrence alone clears CRITICAL on its own.
+HONEYTOKEN_POINTS = 40
 
 FAILED_LOGIN_POINTS = 10
 FAILED_LOGIN_MAX = 30
@@ -137,6 +153,36 @@ def _already_opened_in_session(db: DbSession, session: UserSession, file_id: int
     )
 
 
+def role_weight(user: User, file: File):
+    """Return (multiplier, explanation) for this user reaching for this file.
+
+    Folder membership is the measure, not the decoy's target_role: what makes
+    an access interesting is whether the person had business being there.
+    """
+    folder = file.folder
+    if folder is not None and not folder.is_normal_for(user.role):
+        return (
+            ROLE_WEIGHT_OUT_OF_ROLE,
+            "x%.2g, %s is outside the %s role" % (
+                ROLE_WEIGHT_OUT_OF_ROLE, folder.name, user.role
+            ),
+        )
+    return (
+        ROLE_WEIGHT_IN_ROLE,
+        "x%.2g, %s is normal for the %s role" % (
+            ROLE_WEIGHT_IN_ROLE,
+            folder.name if folder else "this folder",
+            user.role,
+        ),
+    )
+
+
+def _weighted(points: int, user: User, file: File):
+    """Apply the role weight and return (points, note) for the reason string."""
+    weight, why = role_weight(user, file)
+    return int(round(points * weight)), why
+
+
 def score_open(db: DbSession, session: UserSession, user: User, file: File):
     """Return (action_type, points, reason) for an OPEN."""
     if file.is_honeyfile:
@@ -144,9 +190,15 @@ def score_open(db: DbSession, session: UserSession, user: User, file: File):
             # re-opening the same decoy is not new evidence
             return "OPEN", 0, "honeyfile re-opened (already counted this session)"
         nth = distinct_honeyfiles_opened(db, session) + 1
-        pts = _honeyfile_open_points(nth)
+        base = _honeyfile_open_points(nth)
+        pts, why = _weighted(base, user, file)
         ordinal = {1: "1st", 2: "2nd", 3: "3rd"}.get(nth, str(nth) + "th")
-        return "OPEN", pts, "opened " + ordinal + " distinct honeyfile this session"
+        return (
+            "OPEN",
+            pts,
+            "opened %s distinct honeyfile this session (%d base, %s)"
+            % (ordinal, base, why),
+        )
 
     folder = file.folder
     if folder is not None and not folder.is_normal_for(user.role):
@@ -161,7 +213,13 @@ def score_open(db: DbSession, session: UserSession, user: User, file: File):
 def score_download(db: DbSession, session: UserSession, user: User, file: File):
     """Return (action_type, points, reason) for a DOWNLOAD."""
     if file.is_honeyfile:
-        return "DOWNLOAD", HONEYFILE_DOWNLOAD_POINTS, "downloaded a honeyfile"
+        pts, why = _weighted(HONEYFILE_DOWNLOAD_POINTS, user, file)
+        return (
+            "DOWNLOAD",
+            pts,
+            "downloaded a honeyfile (%d base, %s)"
+            % (HONEYFILE_DOWNLOAD_POINTS, why),
+        )
     return "DOWNLOAD", 0, None
 
 
@@ -247,6 +305,7 @@ def record_action(
     reason: Optional[str] = None,
     file: Optional[File] = None,
     search_query: Optional[str] = None,
+    honeytoken=None,
     check_burst: bool = True,
 ) -> ActivityLog:
     """Write one activity log, fold in the burst bonus, update the session score.
@@ -262,6 +321,7 @@ def record_action(
         action_type=action_type,
         target_file_id=file.id if file else None,
         search_query=search_query,
+        honeytoken_id=honeytoken.id if honeytoken else None,
         points_awarded=max(0, int(points)),
         reason=reason,
         timestamp=now,
@@ -283,6 +343,9 @@ def record_action(
                 log.reason = log.reason + "; " + burst_note if log.reason else burst_note
         apply_score(db, session, log.points_awarded)
         _maybe_trigger_decoy_mode(db, session)
+        # Runs beside the rules and cannot influence them: it reads the
+        # session's shape and writes only its own columns.
+        anomaly.update_session(db, session)
 
     db.flush()
     return log

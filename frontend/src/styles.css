@@ -94,3 +94,125 @@ tr.deception td.muted { color: #c9b8ee; }
 .scroll-box { max-height: 460px; overflow: auto; }
 .panel { overflow-x: auto; }
 .col-wide { flex: 2; min-width: 380px; }
+
+/* ------------------------------------------------------------------ */
+/* Session risk reconstruction                                         */
+/* Roles are declared once and re-stepped for dark, not flipped.       */
+/* ------------------------------------------------------------------ */
+.viz-root {
+  color-scheme: light;
+  --viz-surface: #fcfcfb;
+  --viz-line: #2a78d6;
+  --viz-grid: #e1e0d9;
+  --viz-axis: #c3c2b7;
+  --viz-muted: #898781;
+  --viz-ink: #0b0b0b;
+  --viz-routine: #898781;
+  --viz-warning: #fab219;
+  --viz-critical: #d03b3b;
+  --viz-annotation: #4a3aa7;
+  background: var(--viz-surface);
+  border: 1px solid rgba(11, 11, 11, 0.1);
+  padding: 10px 12px 4px 12px;
+  margin-bottom: 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --viz-surface: #1a1a19;
+    --viz-line: #3987e5;
+    --viz-grid: #2c2c2a;
+    --viz-axis: #383835;
+    --viz-ink: #ffffff;
+    --viz-annotation: #9085e9;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --viz-surface: #1a1a19;
+  --viz-line: #3987e5;
+  --viz-grid: #2c2c2a;
+  --viz-axis: #383835;
+  --viz-ink: #ffffff;
+  --viz-annotation: #9085e9;
+}
+
+.viz-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--viz-muted);
+  margin-bottom: 4px;
+}
+.viz-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.viz-plot { position: relative; }
+.viz-plot svg { width: 100%; height: auto; display: block; }
+
+.viz-line { fill: none; stroke: var(--viz-line); stroke-width: 2; }
+.viz-grid { stroke: var(--viz-grid); stroke-width: 1; }
+.viz-grid-critical { stroke: var(--viz-critical); opacity: 0.45; }
+.viz-axis { stroke: var(--viz-axis); stroke-width: 1; }
+.viz-tick, .viz-band-label, .viz-annotation-label {
+  fill: var(--viz-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.viz-band-label { font-size: 9px; letter-spacing: 0.4px; }
+.viz-annotation-label { fill: var(--viz-annotation); font-weight: bold; }
+.viz-endpoint {
+  fill: var(--viz-ink);
+  font-size: 13px;
+  font-weight: bold;
+}
+
+/* 2px surface ring keeps overlapping markers separable. */
+.viz-marker { stroke: var(--viz-surface); stroke-width: 2; }
+.mk-routine { fill: var(--viz-routine); }
+.mk-warning { fill: var(--viz-warning); }
+.mk-critical { fill: var(--viz-critical); }
+.mk-annotation { stroke: var(--viz-annotation); stroke-width: 2; fill: none; }
+
+.viz-hit { fill: transparent; cursor: pointer; }
+
+.viz-tooltip {
+  position: absolute;
+  transform: translate(-50%, -125%);
+  background: var(--viz-surface);
+  border: 1px solid rgba(11, 11, 11, 0.18);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.14);
+  color: var(--viz-ink);
+  padding: 5px 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* Honeytoken use: the strongest signal in the system, so it outranks the
+   honeyfile row tint and reads as critical rather than merely notable. */
+tr.token td { background: #d03b3b; color: #fff; }
+tr.token td.muted { color: #ffe0e0; }
+.token-tag { font-weight: bold; letter-spacing: 0.5px; }
+.tile-critical { border: 2px solid #d03b3b; }
+.tile-critical .num { color: #d03b3b; }
+
+/* Anomaly model verdict. Deliberately not styled like the rule levels - it is
+   a second opinion, not another severity band. */
+.anomaly-flag { color: #4a3aa7; font-weight: bold; }
+.anomaly-ok { color: #52514e; }
+.anomaly-box {
+  margin: 8px 0 0 0;
+  padding: 6px 8px;
+  border-left: 4px solid #c3c2b7;
+  background: #f7f7f5;
+  font-size: 12px;
+}
+.anomaly-box-flag { border-left-color: #4a3aa7; background: #f3edff; }

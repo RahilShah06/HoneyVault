@@ -24,6 +24,7 @@ class ActivityOut(BaseModel):
     folder_name: Optional[str]
     is_honeyfile: bool
     search_query: Optional[str]
+    honeytoken_label: Optional[str]
     points_awarded: int
     reason: Optional[str]
     timestamp: str
@@ -44,6 +45,7 @@ def serialize_log(log: ActivityLog) -> ActivityOut:
         folder_name=(f.folder.name if f and f.folder else None),
         is_honeyfile=bool(f.is_honeyfile) if f else False,
         search_query=log.search_query,
+        honeytoken_label=(log.honeytoken.label if log.honeytoken else None),
         points_awarded=log.points_awarded,
         reason=log.reason,
         timestamp=log.timestamp.isoformat() + "Z",

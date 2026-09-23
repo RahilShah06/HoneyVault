@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, clearAuth, getUser } from '../api'
+import SessionTimeline from '../components/SessionTimeline'
 
 const POLL_MS = 4000
 
@@ -14,6 +15,20 @@ function Level({ level }) {
   return <span className={`level-${level}`}>{level}</span>
 }
 
+// The model's verdict, kept visually separate from the rule level so the two
+// can be read against each other. A dash means unscored, not "normal".
+function Anomaly({ session }) {
+  if (session.anomaly_score === null || session.anomaly_score === undefined) {
+    return <span className="muted" title="not scored - too few actions, or no baseline for this user yet">-</span>
+  }
+  return (
+    <span className={session.anomaly_flag ? 'anomaly-flag' : 'anomaly-ok'}>
+      {session.anomaly_flag ? 'UNUSUAL' : 'typical'}
+      <span className="muted"> {session.anomaly_score.toFixed(3)}</span>
+    </span>
+  )
+}
+
 function eventTarget(e) {
   if (e.filename) return `${e.folder_name || ''}/${e.filename}`
   if (e.search_query) return `"${e.search_query}"`
@@ -21,17 +36,27 @@ function eventTarget(e) {
 }
 
 const DECEPTION_EVENT = 'ACTIVE_DECEPTION_TRIGGERED'
+const HONEYTOKEN_EVENT = 'HONEYTOKEN_USED'
 
 // The system responding, not the user acting - it gets its own row treatment
 // in both the live feed and the per-session timeline.
 function rowClass(e) {
   if (e.action_type === DECEPTION_EVENT) return 'deception'
+  if (e.action_type === HONEYTOKEN_EVENT) return 'token'
   return e.is_honeyfile ? 'honey' : ''
 }
 
 function ActionCell({ event }) {
   if (event.action_type === DECEPTION_EVENT) {
     return <span className="deception-tag">ACTIVE DECEPTION TRIGGERED</span>
+  }
+  if (event.action_type === HONEYTOKEN_EVENT) {
+    return (
+      <span className="token-tag">
+        HONEYTOKEN USED
+        {event.honeytoken_label ? ` (${event.honeytoken_label})` : ''}
+      </span>
+    )
   }
   return (
     <>
@@ -153,6 +178,12 @@ export default function Admin() {
             <div className="num">{summary ? summary.high_risk_users : '-'}</div>
             <div className="label">High-risk users (&gt;50)</div>
           </div>
+          <div className={summary && summary.honeytokens_used > 0 ? 'tile tile-critical' : 'tile'}>
+            <div className="num">
+              {summary ? `${summary.honeytokens_used}/${summary.honeytokens_planted}` : '-'}
+            </div>
+            <div className="label">Honeytokens used</div>
+          </div>
         </div>
 
         <div className="row">
@@ -168,6 +199,7 @@ export default function Admin() {
                     <th>Role</th>
                     <th>Score</th>
                     <th>Level</th>
+                    <th>Anomaly</th>
                     <th>Active</th>
                     <th></th>
                   </tr>
@@ -181,6 +213,9 @@ export default function Admin() {
                       <td>{s.total_risk_score}</td>
                       <td>
                         <Level level={s.risk_level} />
+                      </td>
+                      <td>
+                        <Anomaly session={s} />
                       </td>
                       <td>{s.is_active ? 'yes' : 'no'}</td>
                       <td>
@@ -258,6 +293,37 @@ export default function Admin() {
                   ? ` - logout: ${fmtTime(detail.session.logout_time)}`
                   : ' - still active'}
               </p>
+              {detail.session.anomaly_score !== null &&
+                detail.session.anomaly_score !== undefined && (
+                  <p
+                    className={
+                      detail.session.anomaly_flag
+                        ? 'anomaly-box anomaly-box-flag'
+                        : 'anomaly-box'
+                    }
+                  >
+                    <strong>
+                      Behavioural model:{' '}
+                      {detail.session.anomaly_flag
+                        ? 'UNUSUAL for this user'
+                        : 'consistent with this user'}
+                    </strong>{' '}
+                    <span className="muted">
+                      (score {detail.session.anomaly_score.toFixed(3)})
+                    </span>
+                    {detail.anomaly_reasons && detail.anomaly_reasons.length > 0 && (
+                      <>
+                        <br />
+                        {detail.anomaly_reasons.join(' · ')}
+                      </>
+                    )}
+                    <br />
+                    <span className="muted">
+                      Scored independently of the rules above - it never sees
+                      points, honeyfiles or honeytokens.
+                    </span>
+                  </p>
+                )}
               {detail.session.decoy_mode && (
                 <p className="deception-banner">
                   ACTIVE DECEPTION ENGAGED - every file this session opens or
@@ -272,6 +338,9 @@ export default function Admin() {
                 </button>
               )}
             </div>
+
+            <h2 style={{ marginTop: 12 }}>Risk reconstruction</h2>
+            <SessionTimeline timeline={detail.timeline} />
 
             <h2 style={{ marginTop: 12 }}>Action timeline</h2>
             <table>

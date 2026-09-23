@@ -3,8 +3,13 @@
 Columns additive to the spec'd schema, and why each exists:
   * sessions.burst_awarded   - the rapid-activity bonus fires once per session
   * sessions.decoy_mode      - latched on when the session first hits CRITICAL
+  * sessions.anomaly_score   - Isolation Forest output, kept apart from the rules
+  * sessions.is_synthetic    - generated baseline traffic, not real behaviour
   * activity_logs.reason     - human-readable breakdown of points_awarded
   * files.decoy_generated_at - when this decoy's content was generated/cached
+
+The honeytokens table is new rather than a column: one decoy file can carry
+several planted credentials, and each needs to be traced back on its own.
 """
 import datetime as dt
 
@@ -12,6 +17,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     JSON,
@@ -32,6 +38,7 @@ ACTION_TYPES = [
     "SEARCH",
     "RESTRICTED_ATTEMPT",
     "ACTIVE_DECEPTION_TRIGGERED",
+    "HONEYTOKEN_USED",
 ]
 
 # target_role value meaning "this decoy is bait for anyone"
@@ -86,6 +93,30 @@ class File(Base):
     folder = relationship("Folder", back_populates="files")
 
 
+class Honeytoken(Base):
+    """A planted fake credential, and the decoy file it was planted in.
+
+    The value is written into the decoy body in place of a redaction marker.
+    Nothing in the system ever accepts one as valid: the only thing that can
+    happen to a honeytoken is that someone tries to *use* it, and that is
+    close to proof of compromise rather than a behavioural hint.
+    """
+
+    __tablename__ = "honeytokens"
+
+    id = Column(Integer, primary_key=True)
+    file_id = Column(Integer, ForeignKey("files.id"), nullable=False)
+    token = Column(String(128), unique=True, nullable=False, index=True)
+    # what it was standing in for, e.g. "STRIPE_LIVE_API_KEY" - display only
+    label = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
+    # set the first time this token is seen in an inbound request
+    first_used_at = Column(DateTime, nullable=True)
+    use_count = Column(Integer, nullable=False, default=0)
+
+    file = relationship("File")
+
+
 class UserSession(Base):
     """One login session. Table name stays `sessions` per the spec."""
 
@@ -101,6 +132,13 @@ class UserSession(Base):
     # Latched true the first time this session crosses into CRITICAL. From then
     # on every file this session opens or downloads is served decoy content.
     decoy_mode = Column(Boolean, nullable=False, default=False)
+
+    # Anomaly detection runs alongside the rules and never feeds into them.
+    # NULL means "not scored": no model on disk, or scikit-learn not installed.
+    anomaly_score = Column(Float, nullable=True)
+    anomaly_flag = Column(Boolean, nullable=False, default=False)
+    # Sessions written as training history rather than observed behaviour.
+    is_synthetic = Column(Boolean, nullable=False, default=False)
 
     user = relationship("User", back_populates="sessions")
     logs = relationship("ActivityLog", back_populates="session")
@@ -120,6 +158,7 @@ class ActivityLog(Base):
     action_type = Column(String(32), nullable=False)
     target_file_id = Column(Integer, ForeignKey("files.id"), nullable=True)
     search_query = Column(String(255), nullable=True)
+    honeytoken_id = Column(Integer, ForeignKey("honeytokens.id"), nullable=True)
     points_awarded = Column(Integer, nullable=False, default=0)
     reason = Column(String(255), nullable=True)
     timestamp = Column(DateTime, nullable=False, default=utcnow, index=True)
@@ -127,3 +166,4 @@ class ActivityLog(Base):
     session = relationship("UserSession", back_populates="logs")
     user = relationship("User")
     target_file = relationship("File")
+    honeytoken = relationship("Honeytoken")

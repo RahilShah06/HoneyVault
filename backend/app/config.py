@@ -18,18 +18,29 @@ load_dotenv(ENV_PATH, override=False)
 LLM_PROVIDER = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
 LLM_API_KEY = (os.environ.get("LLM_API_KEY") or "").strip()
 
-# Providers this build knows how to call. Anything else falls back.
-SUPPORTED_PROVIDERS = ("anthropic",)
+# Small, cheap generation: a dozen lines of fake text per honeyfile. These are
+# per-provider defaults; which one applies depends on LLM_PROVIDER. Setting
+# LLM_MODEL in .env overrides whichever is chosen.
+# gemini-3.5-flash-lite answers this in ~3s and is plenty for 15 lines of
+# fake text. The 2.5-era models are no longer issued to new keys.
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+ANTHROPIC_MODEL = "claude-opus-5"
 
-# Small, cheap generation: a dozen lines of fake text per honeyfile.
-LLM_MODEL = "claude-opus-5"
+LLM_MODEL = (os.environ.get("LLM_MODEL") or "").strip()
 LLM_MAX_TOKENS = 1024
 LLM_TIMEOUT_SECONDS = 30.0
 
+# Which provider names are wired up lives with the implementations, in
+# detection/decoy_generator.py, so adding one means touching a single file.
+
 
 def llm_configured() -> bool:
-    """True only when a supported provider *and* a key are both present."""
-    return bool(LLM_API_KEY) and LLM_PROVIDER in SUPPORTED_PROVIDERS
+    """True when a provider *and* a key are both present.
+
+    Whether that provider is one this build can actually call is the decoy
+    generator's question to answer - it owns the implementations.
+    """
+    return bool(LLM_API_KEY) and bool(LLM_PROVIDER)
 
 
 def llm_status() -> str:
@@ -40,9 +51,4 @@ def llm_status() -> str:
         return "LLM_API_KEY is empty in backend/.env"
     if not LLM_PROVIDER:
         return "LLM_PROVIDER is empty in backend/.env"
-    if LLM_PROVIDER not in SUPPORTED_PROVIDERS:
-        return "LLM_PROVIDER=%s is not supported (supported: %s)" % (
-            LLM_PROVIDER,
-            ", ".join(SUPPORTED_PROVIDERS),
-        )
     return "provider %s configured" % LLM_PROVIDER

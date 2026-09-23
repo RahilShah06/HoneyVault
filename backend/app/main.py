@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db
+from app.middleware import honeytoken_watch
 from app.routes import activity, auth, dashboard, files
 
 app = FastAPI(
@@ -27,6 +28,11 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
+
+# Registered before the routers so it sees every request, including ones that
+# never reach a route (bad auth, 404s) - a stolen credential being tried is
+# most likely to show up on exactly those.
+app.middleware("http")(honeytoken_watch)
 
 app.include_router(auth.router)
 app.include_router(files.router)

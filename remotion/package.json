@@ -1,0 +1,16 @@
+{
+  "name": "honeyvault-demo",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "render": "remotion render src/index.js Demo ../cloud-honeyvault-demo.mp4",
+    "studio": "remotion studio"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.409",
+    "@remotion/transitions": "^4.0.409",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "remotion": "4.0.409"
+  }
+}

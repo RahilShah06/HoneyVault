@@ -22,6 +22,7 @@ import datetime as dt
 from sqlalchemy.orm import Session as DbSession
 
 from app import config
+from app.detection import honeytoken
 from app.models import ANY_ROLE, File, utcnow
 
 # ---------------------------------------------------------------------------
@@ -149,6 +150,12 @@ USER_PROMPT = (
 )
 
 
+def _prompt_for(filename: str, target_role: str, kind: str) -> str:
+    """The one user-facing instruction, shared by every provider."""
+    role = target_role if target_role and target_role != ANY_ROLE else "an employee"
+    return USER_PROMPT.format(kind=kind, role=role, filename=filename)
+
+
 def _generate_via_anthropic(filename: str, target_role: str, kind: str) -> str:
     """One short, non-streaming Messages call. Raises on any failure."""
     import anthropic
@@ -157,22 +164,16 @@ def _generate_via_anthropic(filename: str, target_role: str, kind: str) -> str:
         api_key=config.LLM_API_KEY,
         timeout=config.LLM_TIMEOUT_SECONDS,
     )
-    role = target_role if target_role and target_role != ANY_ROLE else "an employee"
 
     response = client.beta.messages.create(
-        model=config.LLM_MODEL,
+        model=config.LLM_MODEL or config.ANTHROPIC_MODEL,
         max_tokens=config.LLM_MAX_TOKENS,
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
         output_config={"effort": "low"},
         system=SYSTEM_PROMPT,
         messages=[
-            {
-                "role": "user",
-                "content": USER_PROMPT.format(
-                    kind=kind, role=role, filename=filename
-                ),
-            }
+            {"role": "user", "content": _prompt_for(filename, target_role, kind)}
         ],
     )
 
@@ -187,6 +188,65 @@ def _generate_via_anthropic(filename: str, target_role: str, kind: str) -> str:
     if not text:
         raise RuntimeError("model returned no text")
     return text + "\n"
+
+
+def _generate_via_gemini(filename: str, target_role: str, kind: str) -> str:
+    """One short generate_content call against Google AI Studio.
+
+    Raises on any failure, including a safety block - the caller turns that
+    into the pre-written fallback body.
+    """
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(
+        api_key=config.LLM_API_KEY,
+        # Without an explicit timeout a slow model would hang a /open request.
+        http_options=types.HttpOptions(
+            timeout=int(config.LLM_TIMEOUT_SECONDS * 1000)
+        ),
+    )
+
+    response = client.models.generate_content(
+        model=config.LLM_MODEL or config.GEMINI_MODEL,
+        contents=_prompt_for(filename, target_role, kind),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            max_output_tokens=config.LLM_MAX_TOKENS,
+        ),
+    )
+
+    # A prompt refused outright reports why on prompt_feedback and comes back
+    # with no candidates at all.
+    feedback = getattr(response, "prompt_feedback", None)
+    if feedback is not None and getattr(feedback, "block_reason", None):
+        raise RuntimeError("prompt blocked: %s" % feedback.block_reason)
+
+    if not response.candidates:
+        raise RuntimeError("no candidates returned")
+
+    finish = response.candidates[0].finish_reason
+    # STOP is the clean finish. MAX_TOKENS still carries usable text; anything
+    # else (SAFETY, RECITATION, ...) is a block.
+    if finish is not None and finish.name not in ("STOP", "MAX_TOKENS"):
+        raise RuntimeError("generation stopped: %s" % finish.name)
+
+    text = (response.text or "").strip()
+    if not text:
+        raise RuntimeError("model returned no text")
+    return text + "\n"
+
+
+# Every wired-up provider, by the value you put in LLM_PROVIDER. Adding one
+# means writing a function with this signature - (filename, target_role, kind)
+# -> the file body, raising on any failure - and listing it here. Nothing else
+# changes: the caching, the fallback and the terminal reporting are all
+# provider-agnostic.
+PROVIDERS = {
+    "gemini": _generate_via_gemini,
+    "google": _generate_via_gemini,  # the same thing under the name people type
+    "anthropic": _generate_via_anthropic,
+}
 
 
 def generate_content(filename: str, target_role: str):
@@ -204,8 +264,17 @@ def generate_content(filename: str, target_role: str):
         )
         return fallback_content(target_role), "fallback"
 
+    generate = PROVIDERS.get(config.LLM_PROVIDER)
+    if generate is None:
+        print(
+            "decoy: using fallback decoy content for %s - LLM_PROVIDER=%s is not "
+            "wired up (available: %s)"
+            % (filename, config.LLM_PROVIDER, ", ".join(sorted(PROVIDERS)))
+        )
+        return fallback_content(target_role), "fallback"
+
     try:
-        content = _generate_via_anthropic(filename, target_role, kind)
+        content = generate(filename, target_role, kind)
     except Exception as exc:  # noqa: BLE001 - the demo must not depend on this
         print(
             "decoy: using fallback decoy content for %s - %s generation failed: %s"
@@ -225,6 +294,21 @@ def generate_content(filename: str, target_role: str):
 # ---------------------------------------------------------------------------
 
 
+def build_and_plant(db: DbSession, f: File) -> str:
+    """Generate one decoy body and plant a honeytoken at every redaction marker.
+
+    The generator is told to write `<redacted in this build>` wherever a secret
+    would go; those markers become the planted tokens. Callers are responsible
+    for committing.
+    """
+    honeytoken.clear_tokens(db, f)
+    content, _source = generate_content(f.filename, f.target_role)
+    content = honeytoken.plant_tokens(db, f, content)
+    f.content = content
+    f.decoy_generated_at = utcnow()
+    return content
+
+
 def ensure_decoy_content(db: DbSession, f: File) -> File:
     """Fill a honeyfile's body once, then leave it alone forever.
 
@@ -234,9 +318,7 @@ def ensure_decoy_content(db: DbSession, f: File) -> File:
     if not f.is_honeyfile or (f.content or "").strip():
         return f
 
-    content, _source = generate_content(f.filename, f.target_role)
-    f.content = content
-    f.decoy_generated_at = utcnow()
+    build_and_plant(db, f)
     db.commit()
     return f
 

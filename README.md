@@ -33,6 +33,8 @@ the LLM is an upgrade to the decoy text, never a dependency.
 | Frontend | React (Vite)                                      |
 | Database | SQLite (`backend/honeyvault.db`, created on seed)  |
 | Auth     | bcrypt password hashing (passlib) + JWT bearer token |
+| Decoys   | pluggable LLM provider (Gemini or Anthropic), with an offline fallback |
+| Anomaly  | scikit-learn Isolation Forest over per-user baselines (optional) |
 
 ## Layout
 
@@ -51,9 +53,14 @@ honeyVault/
         files.py          folders, file open/download, search
         activity.py       raw activity-log queries (admin)
         dashboard.py      summary tiles, event feed, session drill-down
+      baseline_traffic.py  synthetic normal history, so the model has a baseline
+      middleware.py       honeytoken scanning on every inbound request
       detection/
         risk_engine.py    the scoring rules
         decoy_generator.py  role-tailored decoy content, generated and cached
+        honeytoken.py     planting tokens in decoys, and catching their use
+        features.py       session -> feature vector, and per-user baselines
+        anomaly.py        Isolation Forest: train, load, score
     .env.example        LLM_PROVIDER / LLM_API_KEY, both empty
     requirements.txt
   frontend/               Vite React app: Login, Drive, Admin
@@ -90,8 +97,15 @@ API on <http://localhost:8000>, interactive docs at <http://localhost:8000/docs>
 
 `--reset` drops every table, which also clears sessions and activity logs — the
 fastest way to get back to a clean demo. Seeding also fills in each honeyfile's
-decoy body; `--regenerate-decoys` throws those bodies away and writes fresh
-ones.
+decoy body, plants honeytokens in them, generates 45 days of baseline traffic
+and trains the anomaly model on it.
+
+| Flag | Effect |
+| ---- | ------ |
+| `--reset` | drop every table first |
+| `--regenerate-decoys` | discard cached decoy bodies and write fresh ones |
+| `--no-history` | skip baseline generation and model training |
+| `--history-days N` | days of baseline traffic to generate (default 45) |
 
 The `.env` step is optional. With no `.env` at all, seeding prints
 `using fallback decoy content — no LLM_PROVIDER or LLM_API_KEY set` for each
@@ -176,13 +190,26 @@ Two variables, read from `backend/.env` via `python-dotenv`, in one place —
 `app/config.py`:
 
 ```
-LLM_PROVIDER=
-LLM_API_KEY=
+LLM_PROVIDER=gemini
+LLM_API_KEY=your-key-here
 ```
 
 Copy `backend/.env.example` to `backend/.env` and fill them in. `.env` is
-gitignored and **no key value appears anywhere in this repository**. The
-supported provider value is `anthropic`.
+gitignored and **no key value appears anywhere in this repository**.
+
+| `LLM_PROVIDER` | Backend | Default model |
+| -------------- | ------- | ------------- |
+| `gemini` (or `google`) | Google AI Studio, via `google-genai` | `gemini-3.5-flash-lite` |
+| `anthropic`            | Anthropic API, via `anthropic`       | `claude-opus-5` |
+
+Set `LLM_MODEL` in `.env` to override the default for whichever provider is
+selected. An unrecognised `LLM_PROVIDER` is not an error — it logs and falls
+back, like a missing key.
+
+Adding a provider means writing one function in `detection/decoy_generator.py`
+with the signature `(filename, target_role, kind) -> str` and listing it in the
+`PROVIDERS` dict. Caching, fallback and reporting are all provider-agnostic, so
+nothing else changes.
 
 ### With no key set
 
@@ -192,6 +219,12 @@ generator uses pre-written per-role content and prints the reason:
 
 ```
 decoy: using fallback decoy content for bank_credentials.txt - no LLM_PROVIDER or LLM_API_KEY set in backend/.env
+```
+
+With a key set, the same step reports what it made instead:
+
+```
+decoy: generated salary sheet content for employee_salary_2026.xlsx (target role: HR)
 ```
 
 Every honeyfile still ends up with plausible role-specific content, and the
@@ -227,6 +260,157 @@ an `ACTIVE DECEPTION ENGAGED` banner on its detail card.
 
 ---
 
+## Honeytokens
+
+A honeyfile tells you someone **looked**. A honeytoken tells you someone took
+what they found and **tried it**. Browsing a folder has innocent explanations;
+replaying a credential lifted out of a decoy does not — so it scores +40, enough
+to clear CRITICAL on its own, and gets its own action type.
+
+**Planting.** The decoy generator is instructed to write
+`<redacted in this build>` wherever a secret would go. Before the body is
+cached, every one of those markers is replaced with a freshly minted
+`hv_live_…` token and its own `honeytokens` row, labelled with the field it
+stood in. A decoy with no marker — a budget spreadsheet — carries no token,
+because a real one wouldn't.
+
+The model tends to embed them in realistic shapes, which makes them more
+convincing, not less:
+
+```
+AWS_PRODUCTION_ADMIN_KEY=AKIAhv_live_8ecc4431e4e64b2ec55b44d6b36f0691
+DATABASE_MASTER_CONN=postgresql://admin:hv_live_7964a99…@prod-db-cluster.internal:5432/enterprise
+```
+
+**Catching.** `app/middleware.py` scans every inbound request — headers, query
+string, and body — before routing. It runs as middleware rather than a route
+dependency precisely because a stolen credential is most likely to turn up on
+requests that never reach a route: a bad `Authorization` header, a probe at a
+404. A cheap prefix check short-circuits almost every request without opening a
+database session.
+
+Three properties worth stating:
+
+- **A honeytoken never authenticates anything.** Presenting one is logged and
+  scored; the request then fails auth like any other bad token.
+- **Unauthenticated use is still recorded**, with a null session — that is the
+  case where someone is trying the credential itself.
+- **It is scored once per use, not per token**, and the event names the field it
+  was planted as, so a leak is traceable to the exact line of the exact decoy.
+
+---
+
+## Behavioural anomaly detection
+
+An Isolation Forest runs **alongside** the rule engine and never inside it.
+`total_risk_score` is untouched by it, and it never reads `total_risk_score`.
+The two are meant to be read against each other: the rules say *"you opened
+three decoys, here is the arithmetic"*, the model says *"this session does not
+look like how you normally use the drive"*. Agreement is corroboration;
+disagreement is the interesting case. Only the rules can be argued with, which
+is why they stay the explainable primary signal.
+
+### Independence is the whole point
+
+Nothing derived from the rules goes into the model. The nine features are:
+
+```
+action_count  distinct_files  distinct_folders  out_of_role_ratio
+download_ratio  search_ratio  duration_minutes  actions_per_minute  hour_of_day
+```
+
+No points, no honeyfile flag, no honeytoken. A model fed the rules' own outputs
+would agree with them by construction and tell you nothing new.
+
+### Per-user baselines
+
+The same behaviour is ordinary for one person and strange for another, so each
+session is expressed as **z-scores against that user's own history** before the
+model sees it. One forest then learns the shape of normal *deviation* rather
+than absolute volumes that differ from person to person — which is also what
+makes a single model viable on this much data.
+
+Counts and rates are log-compressed and deviations clipped to ±6 sd. Without
+that, a fast session runs hundreds of actions per minute against a baseline of
+two or three, that one feature reaches z ≈ 70, and the model collapses into a
+speed alarm that flags any brisk user.
+
+### The baseline problem, stated honestly
+
+A freshly seeded database has no history, and a model with nothing to call
+normal produces noise dressed up as insight. So seeding generates **45 days of
+ordinary usage** per user (`app/baseline_traffic.py`), marked
+`sessions.is_synthetic` and hidden from the dashboard's operational views:
+office hours, own folders, human pacing, no decoys. The rule engine would score
+every one of them zero, which is the point.
+
+**The model is only as good as that generator's idea of normal.** Against real
+logs you would delete that module and train on those instead. It is a stand-in,
+not a substitute.
+
+```
+baseline: generated 309 synthetic sessions across 6 users over 45 days
+anomaly:  trained on 309 baseline sessions across 6 users -> anomaly_model.joblib
+anomaly:  10/309 baseline sessions flagged (3.2% - expect a small number)
+```
+
+About a third of generated sessions are **quick visits** — three to five actions
+a few seconds apart. Leaving those out was a real bug: every baseline session
+spanned minutes, so an ordinary "log in, grab one file, leave" was flagged
+purely for being short. That false positive came from the generator's idea of
+normal, not the model.
+
+### Baseline poisoning
+
+A user's baseline is built only from their sessions the **rule engine left at
+LOW**. Without that filter a user's own past intrusions count towards their
+normal: do the bad thing often enough and it stops looking unusual, and the
+model goes quiet exactly when it matters. That is the standard attack on
+anomaly detection, and using the rules as the label for "this history was
+clean" is what NEXT.md meant by the rule engine serving as training signal.
+
+Verified by running the same intrusion three times over: the score holds
+instead of drifting toward normal.
+
+```
+repeat 1: rules=97  anomaly=-0.000  flagged=True
+repeat 2: rules=97  anomaly=-0.000  flagged=True
+repeat 3: rules=97  anomaly=-0.000  flagged=True
+```
+
+Those repeats sit close to the threshold — they are shorter runs than the full
+scenario — but they stay flagged rather than decaying into the baseline.
+
+### Measured separation
+
+Both sessions below were driven at human pace against the same trained model:
+
+| Session | Rule score | Anomaly score | Flagged |
+| ------- | ---------- | ------------- | ------- |
+| Designer, own folders, 4 actions | 15 (LOW) | **+0.059** | no |
+| Designer hunting across HR/Finance/IT | 100 (CRITICAL) | **−0.035** | yes |
+
+Top reasons given for the second: *distinct folders 6.0 sd above normal · out
+of role ratio 6.0 sd above normal · actions per minute 3.9 sd above normal.*
+
+Note that the leading reasons are **behavioural**, not speed. An earlier
+version scored raw counts and rates, `actions_per_minute` reached 70 sd, and
+the model degenerated into a speed alarm that flagged any brisk user. Log
+compression plus the ±6 sd clip is what moved "where they went" ahead of "how
+fast they went".
+
+### Optional, like everything else here
+
+`scikit-learn` absent, or no `anomaly_model.joblib` on disk, and
+`score_session` returns `None`: the column stays NULL, the dashboard shows a
+dash, and every other feature behaves identically. Verified by moving the model
+file away — the rule engine still scored a hunting session 75/HIGH with the
+anomaly column null.
+
+Skip it entirely with `python -m app.seed_data --reset --no-history`.
+
+---
+
 ## Risk engine
 
 Points accumulate on the active session and the total is capped at 100.
@@ -241,6 +425,13 @@ Points accumulate on the active session and the total is capped at 100.
 | Open a non-honeyfile outside the role's folders  | +20 (RESTRICTED_ATTEMPT) |
 | 5+ actions within any 60-second window           | +15, once per session |
 | Carried-over failed logins (on successful login) | +10 each, capped at +30 |
+| **Using a planted honeytoken, anywhere**         | **+40 (HONEYTOKEN_USED)** |
+
+Honeyfile open and download points are then **role-weighted**: multiplied by
+**0.5** when the file sits in a folder normal for the user's role, and **1.5**
+when it does not. An IT user opening the IT decoy scores 5; a Designer opening
+the same file scores 15. The multiplier and the reason for it are written into
+each event's "Why" column.
 
 Sensitive keywords: `password`, `credential`, `salary`, `database`, `api`,
 `key`, `bank`, `confidential`, `secret`.
@@ -303,27 +494,35 @@ the behaviour the engine is designed to leave alone.
 
 ### Scenario 2 — insider hunting, escalates to CRITICAL
 
-1. Log in as `employee02` / `employee123`.
-2. Search for `salary` → +15
-3. Search for `credentials` → +15
-4. Search for `api` → +15
-5. Open `employee_salary_2026.xlsx` → +10, plus +15 because five actions landed
-   inside 60 seconds
-6. Open `bank_credentials.txt` → +15 (2nd distinct honeyfile)
-7. Download `bank_credentials.txt` → +20
-8. Open `production_api_keys.txt` → +20 (3rd distinct honeyfile)
+`employee02` is a **Designer**, so every folder below is outside their role and
+every honeyfile open is weighted x1.5.
 
-Raw total 125, capped at **100 — CRITICAL**. The admin dashboard shows a
-**SECURITY ALERT** card for the session and a timeline where every row explains
-the points it earned.
+| # | Action | Points | Running |
+| - | ------ | ------ | ------- |
+| 1 | Log in as `employee02` / `employee123` | 0 | 0 |
+| 2 | Search `salary` | +15 | 15 |
+| 3 | Search `credentials` | +15 | 30 |
+| 4 | Search `api` | +15 | 45 |
+| 5 | Open `employee_salary_2026.xlsx` | **+30** | 75 |
+| 6 | Open `bank_credentials.txt` | +22 | 97 |
+| 7 | Download `bank_credentials.txt` | +30 | 100 |
+| 8 | Open `production_api_keys.txt` | +30 | 100 |
+
+Step 5 is 10 base x1.5 for reaching into HR, **plus** +15 because five actions
+landed inside 60 seconds. Step 6 is the 2nd-distinct-honeyfile rate of 15,
+weighted to 22. Raw total 157, capped at **100 — CRITICAL**.
+
+The admin dashboard shows a **SECURITY ALERT** card for the session and a
+timeline where every row explains the points it earned, including the
+multiplier and why it applied.
 
 ### Scenario 3 — the vault fights back
 
-Step 8 above is where the score crosses 75, so the response has already fired.
-Without logging out:
+Role weighting means the score crosses 75 at **step 6**, not step 8 — the
+response fires earlier than it would have unweighted. Without logging out:
 
 1. On the admin dashboard, open this session. The timeline has an
-   **ACTIVE DECEPTION TRIGGERED** row right after the action that crossed 75,
+   **ACTIVE DECEPTION TRIGGERED** row right after step 6,
    and the detail card carries an `ACTIVE DECEPTION ENGAGED` banner.
 2. Back as `employee02`, open `project_report.pdf` — an ordinary, real file in
    a folder this user is entitled to. It comes back as a fabricated
@@ -333,6 +532,41 @@ Without logging out:
 
 That contrast is the point: the intruder is now reading fiction, and nobody
 else is affected.
+
+### Scenario 4 — the credential gets used
+
+The strongest signal in the system, and the shortest path to CRITICAL.
+
+1. As `employee02`, open `production_api_keys.txt` and copy one of the
+   `hv_live_…` values out of the viewer pane.
+2. Paste it anywhere the app will see it — the search box is easiest:
+   search for that token.
+3. The session jumps **+40** and the admin dashboard shows a red
+   **HONEYTOKEN USED** row naming the field it was planted as
+   (`AWS_PRODUCTION_ADMIN_KEY`, say), plus the `Honeytokens used` tile
+   incrementing.
+
+Try it as a bare `Authorization: Bearer <token>` too — it is rejected as auth
+and still logged, with no session attached:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}
+"   -H "Authorization: Bearer hv_live_..." http://localhost:8000/me
+# 401, and a HONEYTOKEN_USED row appears on the dashboard
+```
+
+### Risk reconstruction
+
+Open any session on the dashboard and the **Risk reconstruction** chart sits
+above the action table: the score climbing to 100, each scored action marked by
+shape (honeyfile, out-of-role, honeytoken) and coloured by severity, the
+CRITICAL threshold drawn at 75, and a rule marking the moment decoys engaged.
+Hovering any marker gives the action, the time and the points. The table
+underneath is the same data in accessible form.
+
+Sessions shorter than 20 seconds are spread by action order rather than elapsed
+time, and the axis says so — a scripted run finishes in milliseconds and a true
+time axis would stack every point in one column.
 
 To demonstrate the remaining two rules:
 
@@ -360,10 +594,10 @@ and return 403 otherwise.
 | POST   | `/files/{id}/download`        | returns a text blob, same decoy-mode rule    |
 | POST   | `/search`                     | `{"query": "..."}` substring match on filenames |
 | GET    | `/activity/logs`              | admin; filter by session, user or action     |
-| GET    | `/admin/summary`              | admin; the four dashboard tiles              |
+| GET    | `/admin/summary`              | admin; the dashboard tiles, incl. honeytokens planted/used |
 | GET    | `/admin/events?limit=50`      | admin; newest-first feed (the UI polls this) |
-| GET    | `/admin/sessions`             | admin; all sessions with score, level and `decoy_mode` |
-| GET    | `/admin/sessions/{id}`        | admin; full action timeline for one session  |
+| GET    | `/admin/sessions`             | admin; real sessions with score, level, `decoy_mode`, anomaly |
+| GET    | `/admin/sessions/{id}`        | admin; timeline plus the model's reasons     |
 | POST   | `/admin/sessions/{id}/end`    | admin; force-end a session (not your own)    |
 | GET    | `/admin/scoring-rules`        | admin; the live engine config, incl. active response |
 
@@ -381,14 +615,32 @@ This is a prototype, and a few things are deliberately simple:
   production one. `RequireAuth` re-checks the token against `GET /me` on every
   mount, so a token that expired or whose session was ended elsewhere lands on
   the login page instead of rendering the app shell.
-- Decoy files never contain a usable secret: credential fields are written as
-  `<redacted in this build>`. Nothing checks whether those fake credentials are
-  ever *used* — that is the honeytoken work described in [NEXT.md](NEXT.md).
+- Decoy files never contain a usable secret. The generator is told to write
+  `<redacted in this build>` wherever a credential would go, and every one of
+  those markers is replaced at plant time with an `hv_live_…` honeytoken that
+  nothing in the system ever accepts as valid.
 - Decoy generation is a single non-streaming call with no retry of its own
-  beyond the SDK's. Anything that fails lands on the fallback content, which is
-  the right trade for a demo but means a slow provider silently costs you the
-  generated text.
+  beyond the SDK's, bounded by a 30s timeout so a slow provider cannot hang a
+  request. Anything that fails lands on the fallback content, which is the
+  right trade for a demo but means an overloaded model silently costs you the
+  generated text. Both SDKs are imported lazily, inside the provider function,
+  so the one you are not using is never loaded.
 - Decoy mode is never cleared once latched. A session stays poisoned until it
   ends; there is no admin control to lift it.
+- The honeytoken scanner reads the request body into memory, capped at 64 KB.
+  That is fine for JSON APIs and would need rethinking for file uploads.
+- Honeytokens are only caught when presented *to this app*. Catching one used
+  against a real external service is the object-storage work in
+  [NEXT.md](NEXT.md).
+- The anomaly model trains on **generated** history, so it learns one
+  generator's idea of normal. Its measured separation is real, but it is not
+  evidence the model would work on a real organization's logs.
+- A user needs at least 8 clean past sessions before they have a baseline, and
+  a session needs 3 actions before it has a shape. Below either, sessions are
+  left unscored rather than guessed at.
+- The baseline filter leans on the rule engine to decide which history was
+  clean. An intrusion the rules never notice would also land in the baseline.
+- The model is retrained only at seed time. There is no online learning, so
+  genuine drift in someone's habits will eventually read as anomalous.
 - Scoring is uniform across roles, so an Admin opening a honeyfile scores the
   same as a Designer. Role-weighted scoring is also in NEXT.md.
