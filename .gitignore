@@ -1,0 +1,14 @@
+# Python
+backend/.venv/
+__pycache__/
+*.py[cod]
+
+# local database
+backend/honeyvault.db
+
+# node
+frontend/node_modules/
+frontend/dist/
+
+# env
+.env

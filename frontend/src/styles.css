@@ -1,0 +1,96 @@
+/* Deliberately plain: this prototype is about behaviour, not visual design. */
+body {
+  font-family: system-ui, Arial, sans-serif;
+  font-size: 14px;
+  margin: 0;
+  background: #f4f4f4;
+  color: #222;
+}
+
+.page { max-width: 1100px; margin: 0 auto; padding: 16px; }
+
+header.bar {
+  background: #2b3a4a;
+  color: #fff;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+header.bar h1 { font-size: 16px; margin: 0; flex: 1; }
+header.bar a { color: #cfe3ff; margin-right: 12px; }
+
+.panel {
+  background: #fff;
+  border: 1px solid #ccc;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+.panel h2 { font-size: 14px; margin: 0 0 8px 0; }
+
+.row { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.col { flex: 1; min-width: 260px; }
+
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ddd; padding: 4px 6px; text-align: left; vertical-align: top; }
+th { background: #eee; }
+
+button { padding: 4px 8px; margin-right: 4px; cursor: pointer; }
+input[type="text"], input[type="password"] { padding: 4px; width: 100%; box-sizing: border-box; }
+
+ul.plain { list-style: none; margin: 0; padding: 0; }
+ul.plain li { padding: 4px 0; border-bottom: 1px solid #eee; }
+ul.plain li button { width: 100%; text-align: left; }
+
+pre.viewer {
+  background: #fafafa;
+  border: 1px solid #ddd;
+  padding: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+  margin: 0;
+}
+
+.tile {
+  border: 1px solid #ccc;
+  background: #fff;
+  padding: 10px;
+  min-width: 150px;
+  flex: 1;
+}
+.tile .num { font-size: 22px; font-weight: bold; }
+.tile .label { color: #555; }
+
+.error { color: #a00; }
+.muted { color: #666; font-size: 12px; }
+
+.level-LOW { color: #0a0; font-weight: bold; }
+.level-MEDIUM { color: #b58900; font-weight: bold; }
+.level-HIGH { color: #d25f00; font-weight: bold; }
+.level-CRITICAL { color: #c00; font-weight: bold; }
+
+.alert-card { border: 2px solid #c00; background: #fff5f5; padding: 10px; }
+.alert-card.level-ok { border-color: #999; background: #fff; }
+.alert-card h3 { margin: 0 0 6px 0; font-size: 14px; }
+
+tr.honey td { background: #fff4f4; }
+
+/* The system's own response, called out apart from the user's actions. */
+tr.deception td { background: #2b1b4d; color: #f3ecff; }
+tr.deception td.muted { color: #c9b8ee; }
+.deception-tag { font-weight: bold; letter-spacing: 0.5px; }
+.deception-banner {
+  margin: 8px 0 0 0;
+  padding: 6px 8px;
+  border-left: 4px solid #6b3fd4;
+  background: #f3edff;
+  color: #3a2470;
+  font-weight: bold;
+}
+
+/* keep long lists from pushing the rest of the page out of reach */
+.scroll-box { max-height: 460px; overflow: auto; }
+.panel { overflow-x: auto; }
+.col-wide { flex: 2; min-width: 380px; }
